@@ -18,6 +18,7 @@ All numeric fields native little-endian; f16 via numpy (x86 = LE).
 The whole file is one gzip stream; the browser decompresses natively.
 """
 import gzip
+import os
 import struct
 import zlib
 
@@ -95,8 +96,19 @@ def write_blob(path, build_ts, class_names, albums, act_vecs, emb_vecs,
     payload = b''.join(body)
     crc = zlib.crc32(payload) & 0xFFFFFFFF
     blob = payload + struct.pack('<I', crc) + MAGIC
+    data = gzip.compress(blob, compresslevel=6, mtime=0)
     with open(path, 'wb') as f:
-        f.write(gzip.compress(blob, compresslevel=6, mtime=0))
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    # never publish an unreadable blob: parse it back before the caller renames
+    # (a truncated/failed write previously shipped a corrupt blob that served
+    # 95% of a graph and looked fine from the outside)
+    chk = read_blob(path)
+    if len(chk['albums']) != len(albums):
+        raise RuntimeError(
+            f'verify failed: wrote {len(albums)} albums, file parses as {len(chk["albums"])}')
+    return len(data)
 
 
 def read_blob(path, to_f32: bool = True) -> dict:
