@@ -167,6 +167,48 @@
       packages.${system} = wrappers // { inherit essentia-models; };
       apps.${system} = builtins.mapAttrs appOf wrappers;
 
+      # Force-evaluate both modules ENABLED (incl. the navidromeEnvFile branch)
+      # so option type errors (e.g. serviceConfig not an attrset) fail here and
+      # not in the user's config. nix flake check's shallow module check does
+      # not catch those, because mkIf-guarded config never gets evaluated.
+      checks.${system} =
+        let
+          eval = modules: (import "${nixpkgs}/nixos/lib/eval-config.nix" {
+            inherit system;
+            inherit modules;
+          });
+          classifierEval = eval [
+            self.nixosModules.classifier {
+              services.tagger-classifier.enable = true;
+              services.tagger-classifier.bind = "127.0.0.1";
+            }
+          ];
+          indexEval = eval [
+            self.nixosModules.index {
+              services.tagger-index.enable = true;
+              services.tagger-index.musicDir = "/data/music";
+              services.tagger-index.classifierUrl = "http://10.100.1.1:9478";
+              services.tagger-index.navidromeEnvFile = "/etc/navidrome.env";
+            }
+          ];
+        in {
+          modules-eval = pkgs.writeText "essentia-tagger-modules-eval.json"
+            (builtins.toJSON {
+              classifier = {
+                inherit (classifierEval.config.systemd.services.tagger-classifier) serviceConfig;
+                venv = classifierEval.config.systemd.services.tagger-venv.serviceConfig.ExecStart;
+                firewall = classifierEval.config.networking.firewall.allowedTCPPorts;
+              };
+              index = {
+                sync = indexEval.config.systemd.services.tagger-sync.serviceConfig.ExecStart;
+                inherit (indexEval.config.systemd.services.tagger-atlas) serviceConfig;
+                build = indexEval.config.systemd.services.tagger-build.serviceConfig.ExecStart;
+                serve = indexEval.config.systemd.services.tagger-serve.serviceConfig.ExecStart;
+                timer = indexEval.config.systemd.timers.tagger-sync.timerConfig.OnCalendar;
+              };
+            });
+        };
+
       devShells.${system}.default = pkgs.mkShell {
         packages = [ python pkgs.jq pkgs.ffmpeg pkgs.zstd essentia-models ];
         shellHook = ''
@@ -269,8 +311,7 @@
             set -euo pipefail
             export TAGGER_VENV="${cfg.stateDir}/venv"
             export ESSENTIA_CLASSES_JSON='${modelEnvAttrs.ESSENTIA_CLASSES_JSON}'
-            ${lib.optionalString (cfg.navidromeEnvFile != null)
-              "source ${toString cfg.navidromeEnvFile}"}
+            # NAVIDROME_* env arrives via the unit's EnvironmentFile (if set)
             ${wrappers.tagger-atlas}/bin/tagger-atlas --tree ${tree'} --music ${cfg.musicDir} --out-dir ${atlasDir'}
           '';
           buildHook = pkgs.writeShellScript "tagger-build-hook" ''
@@ -372,18 +413,15 @@
                 ESSENTIA_CLASSES_JSON = modelEnvAttrs.ESSENTIA_CLASSES_JSON;
                 TAGGER_VENV = "${cfg.stateDir}/venv";
               };
-              serviceConfig = lib.mergeAttrs [
-                {
-                  Type = "oneshot";
-                  User = "essentia";
-                  Group = "essentia";
-                  StateDirectory = "essentia";
-                  ExecStart = "${atlasHook}";
-                }
-                (lib.optionalAttrs (cfg.navidromeEnvFile != null) {
-                  EnvironmentFile = toString cfg.navidromeEnvFile;
-                })
-              ];
+              serviceConfig = {
+                Type = "oneshot";
+                User = "essentia";
+                Group = "essentia";
+                StateDirectory = "essentia";
+                ExecStart = "${atlasHook}";
+              } // (lib.optionalAttrs (cfg.navidromeEnvFile != null) {
+                EnvironmentFile = toString cfg.navidromeEnvFile;
+              });
             };
             systemd.services.tagger-build = {
               description = "tagger blob build (album medians + similarity matrices)";
