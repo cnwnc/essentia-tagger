@@ -71,6 +71,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header('Last-Modified', st.last_modified)
         self.send_header('Cache-Control', 'public, max-age=300')
         self.send_header('Accept-Ranges', 'none')
+        # wg-only listener: origin restrictions buy nothing, and the dev
+        # frontend loads these artifacts cross-origin (file:// / localhost)
+        self.send_header('Access-Control-Allow-Origin', '*')
         if length is not None:
             self.send_header('Content-Length', str(length))
         self.end_headers()
