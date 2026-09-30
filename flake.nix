@@ -69,20 +69,67 @@
       # set TAGGER_VENV to their StateDirectory. `lite` = numpy-only venv for the
       # index side (no models ever load there).
       ensureVenv = lite:
-        let req = if lite then ./requirements-lite.txt else ./requirements.txt;
+        let
+          req = if lite then ./requirements-lite.txt else ./requirements.txt;
+          probe = if lite then "import numpy" else "import numpy, essentia.standard";
+          nvidiaGlob = lib.optionalString (!lite) ''
+            _nv() {
+              _n=""
+              for _d in "$VIRTUAL_ENV"/lib/python3.10/site-packages/nvidia/*/lib; do
+                [ -d "$_d" ] && _n="$_n$_d:"
+              done
+              export LD_LIBRARY_PATH="''${_n}/run/opengl-driver/lib:$LD_LIBRARY_PATH"
+            }
+            _nv
+          '';
         in ''
           export VIRTUAL_ENV="''${TAGGER_VENV:-$PWD/.venv}"
           export TF_CPP_MIN_LOG_LEVEL=3
           export SSL_CERT_FILE="${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
           export PATH="${pkgs.zstd}/bin:${pkgs.ffmpeg}/bin:$PATH"
-          if [ ! -x "$VIRTUAL_ENV/bin/python" ] || [ ! -f "$VIRTUAL_ENV/.installed" ]; then
-            echo "essentia-tagger: creating venv + installing pinned requirements..."
-            ${python}/bin/python -m venv "$VIRTUAL_ENV"
-            "$VIRTUAL_ENV/bin/python" -m pip install --disable-pip-version-check --upgrade pip
-            "$VIRTUAL_ENV/bin/python" -m pip install --disable-pip-version-check -r "${req}"
-            touch "$VIRTUAL_ENV/.installed"
+          # pip wheels dlopen libz/libstdc++ — needed by the import probes below
+          # too, so this goes BEFORE any venv check (numpy fails on libz otherwise)
+          export LD_LIBRARY_PATH="${pkgs.stdenv.cc.cc.lib}/lib:${pkgs.zlib}/lib:${pkgs.zstd}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          ${nvidiaGlob}
+          _req_hash='${req}'   # store path doubles as a content hash
+          _need=0
+          { [ ! -x "$VIRTUAL_ENV/bin/python" ] || [ ! -f "$VIRTUAL_ENV/.installed" ] \
+            || [ ! -f "$VIRTUAL_ENV/.req-hash" ] \
+            || [ "$(cat "$VIRTUAL_ENV/.req-hash" 2>/dev/null)" != "$_req_hash" ]; } && _need=1
+          if [ "$_need" = 1 ]; then
+            # serialize concurrent bootstraps (dev shells / parallel services)
+            exec 9>"$VIRTUAL_ENV.lock"
+            flock -w 1800 9 || true
+            { [ -x "$VIRTUAL_ENV/bin/python" ] && [ -f "$VIRTUAL_ENV/.installed" ] \
+              && [ -f "$VIRTUAL_ENV/.req-hash" ] \
+              && [ "$(cat "$VIRTUAL_ENV/.req-hash" 2>/dev/null)" = "$_req_hash" ]; } && _need=0
+            if [ "$_need" = 1 ]; then
+              # adopt a legacy (pre-hash-marker) venv only if it actually imports
+              if [ -f "$VIRTUAL_ENV/.installed" ] && [ ! -f "$VIRTUAL_ENV/.req-hash" ] \
+                 && "$VIRTUAL_ENV/bin/python" -c '${probe}' >/dev/null 2>&1; then
+                echo "essentia-tagger: adopting existing venv"
+                printf '%s' "$_req_hash" > "$VIRTUAL_ENV/.req-hash"
+              else
+                echo "essentia-tagger: creating venv + installing pinned requirements..."
+                rm -rf "$VIRTUAL_ENV"
+                ${python}/bin/python -m venv "$VIRTUAL_ENV"
+                "$VIRTUAL_ENV/bin/python" -m pip install --disable-pip-version-check --upgrade pip
+                "$VIRTUAL_ENV/bin/python" -m pip install --disable-pip-version-check -r '${req}'
+                ${lib.optionalString (!lite) "_nv"}
+                # hard verify: the import MUST succeed before the venv is trusted
+                # (a sentinel over a broken venv caused the PASSENGER crash loop)
+                if ! "$VIRTUAL_ENV/bin/python" -c '${probe}'; then
+                  echo "essentia-tagger: FATAL: venv installed but import probe failed" >&2
+                  exit 1
+                fi
+                touch "$VIRTUAL_ENV/.installed"
+                printf '%s' "$_req_hash" > "$VIRTUAL_ENV/.req-hash"
+              fi
+            fi
+            exec 9>&-
           fi
           export PATH="$VIRTUAL_ENV/bin:$PATH"
+          ${lib.optionalString (!lite) "_nv"}
           # pip wheels dlopen libz/libstdc++: needed on both lite and full
           export LD_LIBRARY_PATH="${pkgs.stdenv.cc.cc.lib}/lib:${pkgs.zlib}/lib:${pkgs.zstd}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           ${lib.optionalString (!lite) ''
@@ -151,12 +198,22 @@
             };
           };
           config = lib.mkIf cfg.enable {
+            users.groups.essentia = { };
+            users.users.essentia = {
+              isSystemUser = true;
+              group = "essentia";
+              description = "tagger service user";
+            };
+            # index host (and anything else on wg) must reach POST /classify
+            networking.firewall.allowedTCPPorts = [ cfg.port ];
             systemd.services.tagger-venv = {
               description = "tagger venv bootstrap (full: essentia-tensorflow + CUDA, ~3.5GB, needs network once)";
               serviceConfig = {
                 Type = "oneshot";
-                WorkingDirectory = "/var/lib/tagger-classifier";
+                User = "essentia";
+                Group = "essentia";
                 StateDirectory = "tagger-classifier";
+                TimeoutStartSec = "2h";
               };
               environment.TAGGER_VENV = "/var/lib/tagger-classifier/venv";
               script = (ensureVenv false) + "\n";
@@ -171,13 +228,20 @@
               };
               serviceConfig = {
                 ExecStart = "${wrappers.tagger-server}/bin/tagger-server --bind ${cfg.bind} --port ${toString cfg.port} --idle-timeout ${toString cfg.idleTimeout}";
-                DynamicUser = true;
+                User = "essentia";
+                Group = "essentia";
                 StateDirectory = "tagger-classifier";
                 SupplementaryGroups = [ "video" "render" ];
                 Restart = "on-failure";
                 RestartSec = 5;
-                # shm staging + GPU device access; the wg bind is the auth boundary
+                # TF/numpy mmap large .so files out of the state dir; explicit
+                # hardening-offs — DynamicUser sandboxing broke that with
+                # "failed to map segment from shared object" (crash loop)
                 PrivateTmp = false;
+                PrivateDevices = false;
+                MemoryDenyWriteExecute = false;
+                ProtectSystem = "full";
+                ProtectHome = true;
                 NoNewPrivileges = true;
               };
             };
@@ -240,6 +304,8 @@
               group = "essentia";
               description = "tagger index service user";
             };
+            # the KAZOOIE backend (and any wg peer) must reach GET /blob
+            networking.firewall.allowedTCPPorts = [ cfg.port ];
             systemd.services.tagger-venv = {
               description = "tagger venv bootstrap (lite: numpy only)";
               serviceConfig = {

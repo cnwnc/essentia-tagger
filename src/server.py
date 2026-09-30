@@ -30,6 +30,8 @@ from pathlib import Path
 import core
 import schema
 
+DISCONNECT = (BrokenPipeError, ConnectionResetError, TimeoutError)
+
 
 class Engine:
     """Owns the Classifier; lazy init, idle unload, single-job lock."""
@@ -115,11 +117,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
     # ---- helpers -------------------------------------------------------
     def _json(self, code, obj):
         body = json.dumps(obj).encode()
-        self.send_response(code)
-        self.send_header('Content-Type', 'application/json')
-        self.send_header('Content-Length', str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(code)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except DISCONNECT:
+            self.close_connection = True
 
     def do_GET(self):
         if self.path == '/health':
@@ -196,11 +201,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
             # 4. respond
             body = pack_response(results, errors)
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/x-zstd-tar')
-            self.send_header('Content-Length', str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/x-zstd-tar')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except DISCONNECT:
+                self.close_connection = True
+                print(f'job {job[:12]}: client disconnected before response completed',
+                      file=sys.stderr, flush=True)
         except Exception as e:
             try:
                 self._json(500, {'error': f'{type(e).__name__}: {e}'})
@@ -213,6 +223,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
         print(f'{self.address_string()} {fmt % args}', flush=True)
+
+
+class QuietServer(http.server.ThreadingHTTPServer):
+    """Silences the per-connection traceback noise for disconnects."""
+
+    def handle_error(self, request, client_address):
+        if isinstance(sys.exc_info()[1], DISCONNECT):
+            return
+        super().handle_error(request, client_address)
 
 
 def main():
@@ -228,7 +247,7 @@ def main():
     threading.Thread(target=Handler.engine.idle_watchdog, daemon=True).start()
     print(f'classifier listening on {args.bind}:{args.port} '
           f'(idle timeout {args.idle_timeout:.0f}s)', flush=True)
-    http.server.ThreadingHTTPServer((args.bind, args.port), Handler).serve_forever()
+    QuietServer((args.bind, args.port), Handler).serve_forever()
 
 
 if __name__ == '__main__':

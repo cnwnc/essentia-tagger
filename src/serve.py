@@ -7,7 +7,11 @@ import argparse
 import email.utils
 import http.server
 import os
+import sys
 import threading
+
+# client-disconnect errors: normal (e.g. ^C'd curl mid-download), never traceback
+DISCONNECT = (BrokenPipeError, ConnectionResetError, TimeoutError)
 
 
 class BlobState:
@@ -51,15 +55,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         ims = self.headers.get('If-Modified-Since')
         not_modified = (inm and inm.strip() == b.etag) or \
                        (inm is None and ims and b.last_modified == ims)
-        if not_modified:
-            self._send_headers(304, 0)
-            return
-        self._send_headers(200, b.size)
-        if head_only:
-            return
-        with open(b.path, 'rb') as f:
-            while chunk := f.read(1 << 20):
-                self.wfile.write(chunk)
+        try:
+            if not_modified:
+                self._send_headers(304, 0)
+                return
+            self._send_headers(200, b.size)
+            if head_only:
+                return
+            with open(b.path, 'rb') as f:
+                while chunk := f.read(1 << 20):
+                    self.wfile.write(chunk)
+        except DISCONNECT:
+            self.close_connection = True  # client vanished mid-response
 
     def do_GET(self):
         if self.path in ('/', '/blob', '/albums'):
@@ -77,9 +84,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         print(f'{self.address_string()} {fmt % args}', flush=True)
 
 
+class QuietServer(http.server.ThreadingHTTPServer):
+    """Silences the per-connection traceback noise for disconnects."""
+
+    def handle_error(self, request, client_address):
+        if isinstance(sys.exc_info()[1], DISCONNECT):
+            return
+        super().handle_error(request, client_address)
+
+
 def serve(blob_path, bind, port):
     Handler.blob = BlobState(blob_path)
-    http.server.ThreadingHTTPServer((bind, port), Handler).serve_forever()
+    QuietServer((bind, port), Handler).serve_forever()
 
 
 def main():
