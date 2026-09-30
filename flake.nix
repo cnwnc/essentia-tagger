@@ -180,7 +180,11 @@
           config = lib.mkIf cfg.enable {
             systemd.services.tagger-sync = {
               description = "tagger sync (diff library, push to classifier, store results)";
-              environment = modelEnvAttrs // { TAGGER_VENV = "${cfg.stateDir}/venv"; };
+              # only the classes json: the .pb models stay on the classifier host
+              environment = {
+                ESSENTIA_CLASSES_JSON = modelEnvAttrs.ESSENTIA_CLASSES_JSON;
+                TAGGER_VENV = "${cfg.stateDir}/venv";
+              };
               serviceConfig = {
                 Type = "oneshot";
                 ExecStart = "${wrappers.tagger-sync}/bin/tagger-sync --music ${cfg.musicDir} --tree ${cfg.tree} --url ${cfg.classifierUrl}";
