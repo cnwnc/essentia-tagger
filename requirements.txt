@@ -1,0 +1,88 @@
+# Pinned Python dependencies for the essentia-tagger devshell (python 3.10).
+# This is the complete resolved closure (pip freeze), so installs are
+# reproducible. Regenerate with:
+#   nix develop -c bash -c '.venv/bin/pip freeze | grep -v "^-e"'
+#
+# Top-level pins (what we actually depend on):
+#   * essentia-tensorflow 2.1b6.dev1389 - newest release with a cp310 manylinux
+#     wheel (2025-07). It ships the TensorflowPredictMAEST wrapper and bundles
+#     a monolithic libtensorflow 2.5.0 built with CUDA *statically linked*
+#     (cudart/cublas/cuDNN compiled in); it only dlopens the CUDA 11 sonames
+#     + the NVIDIA driver's libcuda.so.1 at runtime.
+#   * tensorflow[and-cuda] 2.19.0 - newest pip TF with a cp310 wheel; the
+#     and-cuda extra pulls matching NVIDIA CUDA 12.5 / cuDNN 9 wheels, so the
+#     python-side TF sees the GPU without any system CUDA install.
+#   * numpy 1.26.4 - essentia's _essentia.so is built against the numpy 1.x
+#     ABI; numpy 2.x breaks it.
+#
+# GPU dlopen requirements (all satisfied via LD_LIBRARY_PATH in flake.nix):
+#   essentia's TF 2.5  -> libcudart.so.11.0, libcublas(+Lt).so.11,
+#                         libcufft.so.10, libcusparse.so.11, libcudnn.so.8
+#                         (+ libcurand.so.10 / libcusolver.so.11, which have
+#                         identical sonames in the CUDA 12 wheels)
+#   pip TF 2.19        -> CUDA 12 / cuDNN 9 sonames from the cu12 wheels
+#   both               -> libcuda.so.1 from /run/opengl-driver/lib (NixOS)
+
+# ---- top-level ----
+essentia-tensorflow==2.1b6.dev1389
+tensorflow[and-cuda]==2.19.0
+numpy==1.26.4
+PyYAML==6.0.2
+six==1.17.0
+
+# ---- CUDA 11 user-space libs for essentia's bundled libtensorflow 2.5.0 ----
+nvidia-cublas-cu11==11.11.3.6
+nvidia-cuda-nvrtc-cu11==11.8.89
+nvidia-cuda-runtime-cu11==11.8.89
+nvidia-cudnn-cu11==8.9.5.30
+nvidia-cufft-cu11==10.9.0.58
+nvidia-cusparse-cu11==11.7.5.86
+
+# ---- CUDA 12 / cuDNN 9 user-space libs (installed by tensorflow[and-cuda]) ----
+nvidia-cublas-cu12==12.5.3.2
+nvidia-cuda-cupti-cu12==12.5.82
+nvidia-cuda-nvcc-cu12==12.5.82
+nvidia-cuda-nvrtc-cu12==12.5.82
+nvidia-cuda-runtime-cu12==12.5.82
+nvidia-cudnn-cu12==9.3.0.75
+nvidia-cufft-cu12==11.2.3.61
+nvidia-curand-cu12==10.3.6.82
+nvidia-cusolver-cu12==11.6.3.83
+nvidia-cusparse-cu12==12.5.1.3
+nvidia-nccl-cu12==2.23.4
+nvidia-nvjitlink-cu12==12.5.82
+
+# ---- resolved transitives ----
+absl-py==2.5.0
+astunparse==1.6.3
+certifi==2026.7.22
+charset-normalizer==3.5.1
+flatbuffers==25.12.19
+gast==0.7.0
+google-pasta==0.2.0
+grpcio==1.84.0
+h5py==3.16.0
+idna==3.20
+keras==3.12.4
+libclang==18.1.1
+Markdown==3.10.3
+markdown-it-py==4.2.0
+MarkupSafe==3.0.3
+mdurl==0.1.2
+ml_dtypes==0.5.4
+namex==0.1.0
+opt_einsum==3.4.0
+optree==0.20.0
+packaging==26.3
+protobuf==5.29.6
+Pygments==2.21.0
+requests==2.34.2
+rich==15.0.0
+tensorboard==2.19.0
+tensorboard-data-server==0.7.2
+tensorflow-io-gcs-filesystem==0.37.1
+termcolor==3.3.0
+typing_extensions==4.16.0
+urllib3==2.8.0
+Werkzeug==3.1.9
+wrapt==2.5.0
