@@ -8,13 +8,18 @@
 #   ESSENTIA_CLASSIFIER_HEAD   genre_discogs519-...-519l-1.pb     (519-style head)
 #   ESSENTIA_CLASSES_JSON      genre_discogs519-...-519l-1.json   (class names; builder needs this too)
 #
-# Packaging note: nixpkgs has no essentia(-tensorflow) and its python tensorflow
-# was removed long ago; essentia's prebuilt wheels are cp310-only. => pinned
-# nixos-25.05 python310 + a venv built once from the exactly-pinned
-# requirements.txt (tensorflow[and-cuda] ships the CUDA libs pip-TF dlopens;
+# Two venv flavors, both built once from exactly-pinned requirement files:
+#   full (requirements.txt): essentia-tensorflow + tensorflow[and-cuda] + CUDA
+#     wheels (~3.5GB) — server + extract (the GPU side) only.
+#   lite (requirements-lite.txt): numpy only — sync + build + serve (the index
+#     side never touches a model, it just moves/stores/derives JSON).
+#
+# essentia packaging reality (why the venv exists at all): nixpkgs has no
+# essentia(-tensorflow) and its python tensorflow was removed long ago;
+# essentia's prebuilt wheels are cp310-only. => pinned nixos-25.05 python310.
 # essentia-tensorflow bundles a monolithic TF 2.5 whose CUDA 11 sonames come
 # from the pinned nvidia-*-cu11 wheels; driver libcuda comes from
-# /run/opengl-driver). Delete .venv (or the StateDirectory venv) to rebuild.
+# /run/opengl-driver. Delete the venv dir to force a rebuild.
 {
   description = "essentia-tagger: MAEST/Discogs-519 classifier + tag index";
 
@@ -58,51 +63,56 @@
         ESSENTIA_CLASSIFIER_HEAD = "${essentia-models}/genre_discogs519-discogs-maest-30s-pw-519l-1.pb";
         ESSENTIA_CLASSES_JSON = "${essentia-models}/genre_discogs519-discogs-maest-30s-pw-519l-1.json";
       };
-      modelExports = lib.concatStringsSep "\n"
-        (lib.mapAttrsToList (k: v: "export ${k}='${v}'") modelEnvAttrs);
 
       # Shared venv bootstrap: dev shell and service wrappers use the same logic.
       # Venv location: $TAGGER_VENV, defaulting to $PWD/.venv (dev); systemd units
-      # set TAGGER_VENV to their StateDirectory.
-      ensureVenv = ''
-        export VIRTUAL_ENV="''${TAGGER_VENV:-$PWD/.venv}"
-        export TF_CPP_MIN_LOG_LEVEL=3
-        export SSL_CERT_FILE="${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
-        if [ ! -x "$VIRTUAL_ENV/bin/python" ] || [ ! -f "$VIRTUAL_ENV/.installed" ]; then
-          echo "essentia-tagger: creating venv + installing pinned requirements (~3.5 GB)..."
-          ${python}/bin/python -m venv "$VIRTUAL_ENV"
-          "$VIRTUAL_ENV/bin/python" -m pip install --disable-pip-version-check --upgrade pip
-          "$VIRTUAL_ENV/bin/python" -m pip install --disable-pip-version-check -r "${./requirements.txt}"
-          touch "$VIRTUAL_ENV/.installed"
-        fi
-        export PATH="$VIRTUAL_ENV/bin:$PATH"
-        # libstdc++ from nix (pip wheels), NVIDIA driver shim, CUDA libs from wheels
-        _nvidia_libs=""
-        for _d in "$VIRTUAL_ENV"/lib/python3.10/site-packages/nvidia/*/lib; do
-          [ -d "$_d" ] && _nvidia_libs="$_nvidia_libs$_d:"
-        done
-        export LD_LIBRARY_PATH="''${_nvidia_libs}${pkgs.stdenv.cc.cc.lib}/lib:${pkgs.zlib}/lib:${pkgs.zstd}/lib:/run/opengl-driver/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-        unset _nvidia_libs _d
-      '';
+      # set TAGGER_VENV to their StateDirectory. `lite` = numpy-only venv for the
+      # index side (no models ever load there).
+      ensureVenv = lite:
+        let req = if lite then ./requirements-lite.txt else ./requirements.txt;
+        in ''
+          export VIRTUAL_ENV="''${TAGGER_VENV:-$PWD/.venv}"
+          export TF_CPP_MIN_LOG_LEVEL=3
+          export SSL_CERT_FILE="${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+          export PATH="${pkgs.zstd}/bin:${pkgs.ffmpeg}/bin:$PATH"
+          if [ ! -x "$VIRTUAL_ENV/bin/python" ] || [ ! -f "$VIRTUAL_ENV/.installed" ]; then
+            echo "essentia-tagger: creating venv + installing pinned requirements..."
+            ${python}/bin/python -m venv "$VIRTUAL_ENV"
+            "$VIRTUAL_ENV/bin/python" -m pip install --disable-pip-version-check --upgrade pip
+            "$VIRTUAL_ENV/bin/python" -m pip install --disable-pip-version-check -r "${req}"
+            touch "$VIRTUAL_ENV/.installed"
+          fi
+          export PATH="$VIRTUAL_ENV/bin:$PATH"
+          # pip wheels dlopen libz/libstdc++: needed on both lite and full
+          export LD_LIBRARY_PATH="${pkgs.stdenv.cc.cc.lib}/lib:${pkgs.zlib}/lib:${pkgs.zstd}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          ${lib.optionalString (!lite) ''
+            # NVIDIA driver shim + CUDA libs from the pip wheels (GPU side only)
+            _nvidia_libs=""
+            for _d in "$VIRTUAL_ENV"/lib/python3.10/site-packages/nvidia/*/lib; do
+              [ -d "$_d" ] && _nvidia_libs="$_nvidia_libs$_d:"
+            done
+            export LD_LIBRARY_PATH="''${_nvidia_libs}/run/opengl-driver/lib:$LD_LIBRARY_PATH"
+            unset _nvidia_libs _d
+          ''}
+        '';
 
       # Role-named app wrapper: ensure env, then exec the program.
-      mkWrapper = name: module:
+      # lite = index-side tools (sync/build/serve); everything else is GPU-side.
+      mkWrapper = name: module: lite:
         pkgs.writeShellScriptBin name ''
           set -euo pipefail
-          ${ensureVenv}
-          ${modelExports}
+          ${ensureVenv lite}
+          ${lib.concatStringsSep "\n"
+            (lib.mapAttrsToList (k: v: "export ${k}='${v}'") modelEnvAttrs)}
           exec python "${./src}/${module}" "$@"
         '';
-      appOf = name: drv: {
-        type = "app";
-        program = "${drv}/bin/${name}";
-      };
+      appOf = name: drv: { type = "app"; program = "${drv}/bin/${name}"; };
       wrappers = {
-        tagger-server = mkWrapper "tagger-server" "server.py";
-        tagger-sync = mkWrapper "tagger-sync" "sync.py";
-        tagger-build = mkWrapper "tagger-build" "build.py";
-        tagger-serve = mkWrapper "tagger-serve" "serve.py";
-        tagger-extract = mkWrapper "tagger-extract" "extract.py";
+        tagger-server = mkWrapper "tagger-server" "server.py" false;
+        tagger-extract = mkWrapper "tagger-extract" "extract.py" false;
+        tagger-sync = mkWrapper "tagger-sync" "sync.py" true;
+        tagger-build = mkWrapper "tagger-build" "build.py" true;
+        tagger-serve = mkWrapper "tagger-serve" "serve.py" true;
       };
     in
     {
@@ -110,16 +120,19 @@
       apps.${system} = builtins.mapAttrs appOf wrappers;
 
       devShells.${system}.default = pkgs.mkShell {
-        packages = [ python pkgs.jq pkgs.ffmpeg essentia-models ];
+        packages = [ python pkgs.jq pkgs.ffmpeg pkgs.zstd essentia-models ];
         shellHook = ''
-          ${ensureVenv}
-          ${modelExports}
+          ${ensureVenv false}
+          ${lib.concatStringsSep "\n"
+            (lib.mapAttrsToList (k: v: "export ${k}='${v}'") modelEnvAttrs)}
           echo "essentia-tagger dev shell (venv: $VIRTUAL_ENV)"
         '';
       };
 
-      # Skeleton deployment modules — refine once the programs land.
-      # classifier = the GPU box role; index = sync timer + build + blob serve.
+      # ------------------------------------------------------------------
+      # classifier: the GPU host role. Deployment declares only the wg bind
+      # address; everything else defaults. DynamicUser keeps it user-free.
+      # ------------------------------------------------------------------
       nixosModules.classifier = { config, lib, ... }:
         let cfg = config.services.tagger-classifier;
         in {
@@ -127,94 +140,174 @@
             enable = lib.mkEnableOption "tagger classifier server (POST /classify)";
             bind = lib.mkOption {
               type = lib.types.str;
-              default = "0.0.0.0";
-              description = "Bind address; set to the wireguard IP in prod (wg is the trust boundary).";
+              default = "127.0.0.1";
+              description = "Bind address; set to the wireguard IP in prod (wg is the trust boundary, no auth).";
             };
             port = lib.mkOption { type = lib.types.port; default = 9478; };
-            stateDir = lib.mkOption { type = lib.types.path; default = "/var/lib/tagger-classifier"; };
+            idleTimeout = lib.mkOption {
+              type = lib.types.ints.positive;
+              default = 600;
+              description = "Seconds of inactivity before unloading models (auto-warm on next request).";
+            };
           };
           config = lib.mkIf cfg.enable {
-            systemd.services.tagger-classifier = {
-              description = "tagger classifier server (MAEST/Discogs-519)";
-              wantedBy = [ "multi-user.target" ];
-              environment = modelEnvAttrs // { TAGGER_VENV = "${cfg.stateDir}/venv"; };
+            systemd.services.tagger-venv = {
+              description = "tagger venv bootstrap (full: essentia-tensorflow + CUDA, ~3.5GB, needs network once)";
               serviceConfig = {
-                ExecStart = "${wrappers.tagger-server}/bin/tagger-server --bind ${cfg.bind} --port ${toString cfg.port}";
-                WorkingDirectory = cfg.stateDir;
+                Type = "oneshot";
+                WorkingDirectory = "/var/lib/tagger-classifier";
                 StateDirectory = "tagger-classifier";
+              };
+              environment.TAGGER_VENV = "/var/lib/tagger-classifier/venv";
+              script = (ensureVenv false) + "\n";
+            };
+            systemd.services.tagger-classifier = {
+              description = "tagger classifier server (MAEST/Discogs-519, auto-warm)";
+              wantedBy = [ "multi-user.target" ];
+              requires = [ "tagger-venv.service" ];
+              after = [ "tagger-venv.service" "network.target" ];
+              environment = modelEnvAttrs // {
+                TAGGER_VENV = "/var/lib/tagger-classifier/venv";
+              };
+              serviceConfig = {
+                ExecStart = "${wrappers.tagger-server}/bin/tagger-server --bind ${cfg.bind} --port ${toString cfg.port} --idle-timeout ${toString cfg.idleTimeout}";
+                DynamicUser = true;
+                StateDirectory = "tagger-classifier";
+                SupplementaryGroups = [ "video" "render" ];
                 Restart = "on-failure";
+                RestartSec = 5;
+                # shm staging + GPU device access; the wg bind is the auth boundary
+                PrivateTmp = false;
+                NoNewPrivileges = true;
               };
             };
           };
         };
 
+      # ------------------------------------------------------------------
+      # index: sync timer + blob build + blob GET endpoint. Deployment
+      # declares only classifierUrl, musicDir, and (optionally) the schedule.
+      # Runs as system user `essentia` in /var/lib/essentia (created here):
+      #   data/  = classifier JSON tree (backfill rsync target)
+      #   blob/  = built similarity blob (served on :9478)
+      # ------------------------------------------------------------------
       nixosModules.index = { config, lib, pkgs, ... }:
         let
           cfg = config.services.tagger-index;
+          tree' = if cfg.tree != null then toString cfg.tree else "${cfg.stateDir}/data";
+          blob' = if cfg.blob != null then toString cfg.blob else "${cfg.stateDir}/blob/albums.bin";
           buildHook = pkgs.writeShellScript "tagger-build-hook" ''
             set -euo pipefail
             export TAGGER_VENV="${cfg.stateDir}/venv"
             export ESSENTIA_CLASSES_JSON='${modelEnvAttrs.ESSENTIA_CLASSES_JSON}'
-            ${wrappers.tagger-build}/bin/tagger-build --tree ${cfg.tree} --out ${cfg.blob}
+            ${wrappers.tagger-build}/bin/tagger-build --tree ${tree'} --out ${blob'}
           '';
         in {
           options.services.tagger-index = {
-            enable = lib.mkEnableOption "tagger index (sync timer + blob build + serve)";
+            enable = lib.mkEnableOption "tagger index (sync timer + blob build + blob serve)";
             classifierUrl = lib.mkOption {
               type = lib.types.str;
               example = "http://10.100.1.1:9478";
               description = "Upstream POST /classify endpoint (wg-only).";
             };
-            musicDir = lib.mkOption { type = lib.types.path; };
-            tree = lib.mkOption { type = lib.types.path; description = "Classifier JSON tree."; };
-            blob = lib.mkOption { type = lib.types.path; description = "Output blob path."; };
-            bind = lib.mkOption { type = lib.types.str; default = "0.0.0.0"; };
-            port = lib.mkOption { type = lib.types.port; default = 9479; };
-            stateDir = lib.mkOption { type = lib.types.path; default = "/var/lib/tagger-index"; };
+            musicDir = lib.mkOption {
+              type = lib.types.path;
+              description = "Music library root (must be readable by the essentia user).";
+            };
             schedule = lib.mkOption {
               type = lib.types.str;
-              default = "*-*-* 03:00:00";
-              description = "sync timer calendar spec (sleep-hours window).";
+              default = "*-*-* 03:30:00";
+              description = "systemd OnCalendar spec for the sync timer (sleep-hours window).";
+            };
+            bind = lib.mkOption { type = lib.types.str; default = "0.0.0.0"; };
+            port = lib.mkOption { type = lib.types.port; default = 9478; };
+            stateDir = lib.mkOption { type = lib.types.path; default = "/var/lib/essentia"; };
+            tree = lib.mkOption {
+              type = with lib.types; nullOr path;
+              default = null;
+              description = "Classifier JSON tree; defaults to \${stateDir}/data (backfill rsync target).";
+            };
+            blob = lib.mkOption {
+              type = with lib.types; nullOr path;
+              default = null;
+              description = "Built similarity blob; defaults to \${stateDir}/blob/albums.bin (served over HTTP).";
             };
           };
           config = lib.mkIf cfg.enable {
+            users.groups.essentia = { };
+            users.users.essentia = {
+              isSystemUser = true;
+              group = "essentia";
+              description = "tagger index service user";
+            };
+            systemd.services.tagger-venv = {
+              description = "tagger venv bootstrap (lite: numpy only)";
+              serviceConfig = {
+                Type = "oneshot";
+                User = "essentia";
+                Group = "essentia";
+                StateDirectory = "essentia";
+              };
+              environment.TAGGER_VENV = "${cfg.stateDir}/venv";
+              script = (ensureVenv true) + "\n";
+            };
             systemd.services.tagger-sync = {
               description = "tagger sync (diff library, push to classifier, store results)";
-              # only the classes json: the .pb models stay on the classifier host
+              after = [ "network.target" "tagger-venv.service" ];
+              requires = [ "tagger-venv.service" ];
+              onSuccess = [ "tagger-build.service" ];
               environment = {
                 ESSENTIA_CLASSES_JSON = modelEnvAttrs.ESSENTIA_CLASSES_JSON;
                 TAGGER_VENV = "${cfg.stateDir}/venv";
               };
               serviceConfig = {
                 Type = "oneshot";
-                ExecStart = "${wrappers.tagger-sync}/bin/tagger-sync --music ${cfg.musicDir} --tree ${cfg.tree} --url ${cfg.classifierUrl}";
-                WorkingDirectory = cfg.stateDir;
-                StateDirectory = "tagger-index";
+                User = "essentia";
+                Group = "essentia";
+                StateDirectory = "essentia";
+                ExecStart = "${wrappers.tagger-sync}/bin/tagger-sync --music ${cfg.musicDir} --tree ${tree'} --url ${cfg.classifierUrl}";
+                TimeoutStartSec = "8h";
               };
             };
             systemd.services.tagger-build = {
-              description = "tagger blob build";
-              environment = { TAGGER_VENV = "${cfg.stateDir}/venv"; };
-              serviceConfig = { Type = "oneshot"; ExecStart = "${buildHook}"; };
-            };
-            systemd.paths.tagger-build = {
-              wantedBy = [ "tagger-sync.service" ];
-              pathChanged = [ "${cfg.tree}" ];
+              description = "tagger blob build (album medians + similarity matrices)";
+              after = [ "tagger-venv.service" ];
+              requires = [ "tagger-venv.service" ];
+              environment = {
+                ESSENTIA_CLASSES_JSON = modelEnvAttrs.ESSENTIA_CLASSES_JSON;
+                TAGGER_VENV = "${cfg.stateDir}/venv";
+              };
+              serviceConfig = {
+                Type = "oneshot";
+                User = "essentia";
+                Group = "essentia";
+                StateDirectory = "essentia";
+                ExecStart = "${buildHook}";
+              };
             };
             systemd.services.tagger-serve = {
-              description = "tagger blob server (ETag/Last-Modified, wg-only)";
-              environment = { TAGGER_VENV = "${cfg.stateDir}/venv"; };
+              description = "tagger blob server (GET blob, ETag/304; wg-only reachability)";
               wantedBy = [ "multi-user.target" ];
+              after = [ "tagger-venv.service" "network.target" ];
+              requires = [ "tagger-venv.service" ];
+              environment = { TAGGER_VENV = "${cfg.stateDir}/venv"; };
               serviceConfig = {
-                ExecStart = "${wrappers.tagger-serve}/bin/tagger-serve --blob ${cfg.blob} --bind ${cfg.bind} --port ${toString cfg.port}";
-                WorkingDirectory = cfg.stateDir;
-                StateDirectory = "tagger-index";
+                ExecStart = "${wrappers.tagger-serve}/bin/tagger-serve --blob ${blob'} --bind ${cfg.bind} --port ${toString cfg.port}";
+                User = "essentia";
+                Group = "essentia";
+                StateDirectory = "essentia";
                 Restart = "on-failure";
+                RestartSec = 5;
+                NoNewPrivileges = true;
               };
             };
             systemd.timers.tagger-sync = {
               wantedBy = [ "timers.target" ];
-              timerConfig = { OnCalendar = cfg.schedule; Persistent = true; };
+              timerConfig = {
+                OnCalendar = cfg.schedule;
+                Persistent = true;
+                RandomizedDelaySec = "10min";
+              };
             };
           };
         };

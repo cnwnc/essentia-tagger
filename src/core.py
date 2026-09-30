@@ -97,3 +97,31 @@ def encode_embedding(vec: np.ndarray, layer: str = EMB_LAYER) -> dict:
         'layer': layer,
         'data': base64.b64encode(v.tobytes()).decode('ascii'),
     }
+
+
+def process_track(classifier: 'Classifier', rel, audio: np.ndarray) -> dict:
+    """audio -> track JSON dict (Contract A wire format, FROZEN).
+
+    Output must stay byte-identical across refactors — ~12k files exist in
+    this format. `rel` is a Path or string of the track's library-relative
+    posix path (e.g. 'Artist/Album/01 - Title.flac').
+    """
+    audio = np.asarray(audio, dtype=np.float32)
+    rel = str(rel)
+    orig_dur = len(audio) / schema.SAMPLE_RATE
+    if len(audio) < int(schema.MIN_SECONDS * schema.SAMPLE_RATE):
+        audio = np.pad(audio, (0, int(schema.MIN_SECONDS * schema.SAMPLE_RATE) - len(audio)))
+
+    pooled_emb, activations = classifier.classify(audio)
+    parts = rel.split('/')
+
+    return {
+        'schema': schema.SCHEMA_VERSION,
+        'path': rel,
+        'artist': parts[0] if len(parts) > 1 else '',
+        'album': parts[1] if len(parts) > 2 else '',
+        'duration_sec': round(orig_dur, 3),
+        'models': models_record(),
+        'embedding': encode_embedding(pooled_emb),
+        'activations': activations,
+    }

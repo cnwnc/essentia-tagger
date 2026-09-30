@@ -66,24 +66,8 @@ def load_task(rel_str):
 
 
 def process_track(classifier, rel: Path, audio: np.ndarray):
-    """audio -> track JSON dict (Contract A). NOTE: output must stay
-    byte-identical across refactors — ~12k files already exist in this format."""
-    orig_dur = len(audio) / schema.SAMPLE_RATE
-    if len(audio) < int(schema.MIN_SECONDS * schema.SAMPLE_RATE):
-        audio = np.pad(audio, (0, int(schema.MIN_SECONDS * schema.SAMPLE_RATE) - len(audio)))
-
-    pooled_emb, activations = classifier.classify(audio)
-
-    return {
-        'schema': schema.SCHEMA_VERSION,
-        'path': str(rel),
-        'artist': rel.parts[0] if len(rel.parts) > 1 else '',
-        'album': rel.parts[1] if len(rel.parts) > 2 else '',
-        'duration_sec': round(orig_dur, 3),
-        'models': core.models_record(),
-        'embedding': core.encode_embedding(pooled_emb),
-        'activations': activations,
-    }
+    """Deprecated shim — moved to core.process_track (shared with server.py)."""
+    return core.process_track(classifier, rel, audio)
 
 
 def main():
