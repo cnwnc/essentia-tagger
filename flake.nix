@@ -159,6 +159,7 @@
         tagger-extract = mkWrapper "tagger-extract" "extract.py" false;
         tagger-sync = mkWrapper "tagger-sync" "sync.py" true;
         tagger-build = mkWrapper "tagger-build" "build.py" true;
+        tagger-atlas = mkWrapper "tagger-atlas" "atlas.py" true;
         tagger-serve = mkWrapper "tagger-serve" "serve.py" true;
       };
     in
@@ -263,11 +264,24 @@
           cfg = config.services.tagger-index;
           tree' = if cfg.tree != null then toString cfg.tree else "${cfg.stateDir}/data";
           blob' = if cfg.blob != null then toString cfg.blob else "${cfg.stateDir}/blob/albums.bin";
+          atlasDir' = if cfg.atlasDir != null then toString cfg.atlasDir else "${cfg.stateDir}/blob";
+          atlasHook = pkgs.writeShellScript "tagger-atlas-hook" ''
+            set -euo pipefail
+            export TAGGER_VENV="${cfg.stateDir}/venv"
+            export ESSENTIA_CLASSES_JSON='${modelEnvAttrs.ESSENTIA_CLASSES_JSON}'
+            ${lib.optionalString (cfg.navidromeEnvFile != null)
+              "source ${toString cfg.navidromeEnvFile}"}
+            ${wrappers.tagger-atlas}/bin/tagger-atlas --tree ${tree'} --music ${cfg.musicDir} --out-dir ${atlasDir'}
+          '';
           buildHook = pkgs.writeShellScript "tagger-build-hook" ''
             set -euo pipefail
             export TAGGER_VENV="${cfg.stateDir}/venv"
             export ESSENTIA_CLASSES_JSON='${modelEnvAttrs.ESSENTIA_CLASSES_JSON}'
-            ${wrappers.tagger-build}/bin/tagger-build --tree ${tree'} --out ${blob'}
+            MAN=""
+            if [ -f "${atlasDir'}/atlas-manifest.json" ]; then
+              MAN="--atlas-manifest ${atlasDir'}/atlas-manifest.json"
+            fi
+            ${wrappers.tagger-build}/bin/tagger-build --tree ${tree'} --out ${blob'} $MAN
           '';
         in {
           options.services.tagger-index = {
@@ -299,6 +313,16 @@
               default = null;
               description = "Built similarity blob; defaults to \${stateDir}/blob/albums.bin (served over HTTP).";
             };
+            navidromeEnvFile = lib.mkOption {
+              type = with lib.types; nullOr (either str path);
+              default = null;
+              description = "Env file with NAVIDROME_BASE_URL/USERNAME/PASSWORD (Subsonic auth, unprivileged user) for the atlas builder.";
+            };
+            atlasDir = lib.mkOption {
+              type = with lib.types; nullOr path;
+              default = null;
+              description = "Atlas output dir; defaults to \${stateDir}/blob (atlas-N.webp + atlas-manifest.json + cache/).";
+            };
           };
           config = lib.mkIf cfg.enable {
             users.groups.essentia = { };
@@ -324,7 +348,6 @@
               description = "tagger sync (diff library, push to classifier, store results)";
               after = [ "network.target" "tagger-venv.service" ];
               requires = [ "tagger-venv.service" ];
-              onSuccess = [ "tagger-build.service" ];
               environment = {
                 ESSENTIA_CLASSES_JSON = modelEnvAttrs.ESSENTIA_CLASSES_JSON;
                 TAGGER_VENV = "${cfg.stateDir}/venv";
@@ -337,6 +360,30 @@
                 ExecStart = "${wrappers.tagger-sync}/bin/tagger-sync --music ${cfg.musicDir} --tree ${tree'} --url ${cfg.classifierUrl}";
                 TimeoutStartSec = "8h";
               };
+              # chain: sync -> atlas -> build (serve stays resident)
+              onSuccess = [ "tagger-atlas.service" ];
+            };
+            systemd.services.tagger-atlas = {
+              description = "tagger atlas build (navidrome covers → webp sprite sheets)";
+              after = [ "tagger-venv.service" ];
+              requires = [ "tagger-venv.service" ];
+              onSuccess = [ "tagger-build.service" ];
+              environment = {
+                ESSENTIA_CLASSES_JSON = modelEnvAttrs.ESSENTIA_CLASSES_JSON;
+                TAGGER_VENV = "${cfg.stateDir}/venv";
+              };
+              serviceConfig = lib.mergeAttrs [
+                {
+                  Type = "oneshot";
+                  User = "essentia";
+                  Group = "essentia";
+                  StateDirectory = "essentia";
+                  ExecStart = "${atlasHook}";
+                }
+                (lib.optionalAttrs (cfg.navidromeEnvFile != null) {
+                  EnvironmentFile = toString cfg.navidromeEnvFile;
+                })
+              ];
             };
             systemd.services.tagger-build = {
               description = "tagger blob build (album medians + similarity matrices)";
@@ -354,14 +401,16 @@
                 ExecStart = "${buildHook}";
               };
             };
+            # chain: sync -> atlas -> build (atlas onSuccess is set in its unit;
+            # serve stays resident)
             systemd.services.tagger-serve = {
-              description = "tagger blob server (GET blob, ETag/304; wg-only reachability)";
+              description = "tagger blob server (GET blob + atlas, ETag/304; wg-only reachability)";
               wantedBy = [ "multi-user.target" ];
               after = [ "tagger-venv.service" "network.target" ];
               requires = [ "tagger-venv.service" ];
               environment = { TAGGER_VENV = "${cfg.stateDir}/venv"; };
               serviceConfig = {
-                ExecStart = "${wrappers.tagger-serve}/bin/tagger-serve --blob ${blob'} --bind ${cfg.bind} --port ${toString cfg.port}";
+                ExecStart = "${wrappers.tagger-serve}/bin/tagger-serve --blob ${blob'} --atlas-dir ${atlasDir'} --bind ${cfg.bind} --port ${toString cfg.port}";
                 User = "essentia";
                 Group = "essentia";
                 StateDirectory = "essentia";

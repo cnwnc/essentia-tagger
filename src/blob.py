@@ -24,9 +24,17 @@ import zlib
 import numpy as np
 
 MAGIC = b'ESSG'
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2  # v2: + id_hash per album, + images section (atlas positions)
 TOP_K = 32
+NO_TILE = 0xFFFF    # images section: sheet==NO_TILE → album has no atlas tile
 HEADER = struct.Struct('<IIQIII')  # version, flags, build_ts, n, n_cls, n_dim (magic is raw bytes)
+
+
+def album_id_hash(artist: str, album_dir: str) -> int:
+    """Stable album identity: first 8 bytes of sha256(artist/album-dir)."""
+    import hashlib
+    h = hashlib.sha256(f'{artist}/{album_dir}'.encode('utf-8')).digest()
+    return struct.unpack('<Q', h[:8])[0]
 
 
 def _wstr(out: list, s: str):
@@ -43,9 +51,11 @@ def _warr(out: list, a: np.ndarray):
 
 
 def write_blob(path, build_ts, class_names, albums, act_vecs, emb_vecs,
-               sim_act, sim_emb, sim_blend, topk) -> None:
+               sim_act, sim_emb, sim_blend, topk, images=None) -> None:
     """albums: list of dicts {artist, album, track_count, duration, parent_shares}
-    topk: tuple (ids u32 [n, TOP_K], sims f32 [n, TOP_K])."""
+    topk: tuple (ids u32 [n, TOP_K], sims f32 [n, TOP_K]).
+    images: None or dict {n_sheets, sheet_dim, tile, tiles: [(sheet,tx,ty) per album],
+                          sha256: [hex str per sheet]}"""
     n = len(albums)
     n_cls = len(class_names)
     n_dim = int(emb_vecs.shape[1])
@@ -61,6 +71,8 @@ def write_blob(path, build_ts, class_names, albums, act_vecs, emb_vecs,
         _wstr(body, a['album'])
         body.append(struct.pack('<I', int(a['track_count'])))
         body.append(struct.pack('<f', float(a['duration'])))
+        body.append(struct.pack('<Q', int(a.get('id_hash',
+                       album_id_hash(a['artist'], a.get('album_dir', a['album']))))))
         _warr(body, a['parent_shares'])
     _warr(body, act_vecs)
     _warr(body, emb_vecs)
@@ -69,6 +81,16 @@ def write_blob(path, build_ts, class_names, albums, act_vecs, emb_vecs,
     _warr(body, sim_blend)
     _warr(body, topk_ids.astype('<u4').reshape(-1))
     _warr(body, topk_sims.astype('<f2').reshape(-1))
+    # images section (always present in v2; n_sheets=0 = no atlas yet)
+    if images is None:
+        images = {'n_sheets': 0, 'sheet_dim': 0, 'tile': 0,
+                  'tiles': [(NO_TILE, 0, 0)] * n, 'sha256': []}
+    body.append(struct.pack('<HHHH', images['n_sheets'], images['sheet_dim'],
+                            images['tile'], 0))  # reserved
+    for (sheet, tx, ty) in images['tiles']:
+        body.append(struct.pack('<HHH', sheet, tx, ty))
+    for h in images['sha256']:
+        body.append(bytes.fromhex(h))
 
     payload = b''.join(body)
     crc = zlib.crc32(payload) & 0xFFFFFFFF
@@ -125,9 +147,11 @@ def read_blob(path, to_f32: bool = True) -> dict:
         artist, album = rstr(), rstr()
         (track_count,) = take('<I')
         (duration,) = take('<f')
+        (id_hash,) = take('<Q')
         parent_shares = rarr((n_cls,), np.float16)
         albums.append({'artist': artist, 'album': album, 'track_count': track_count,
-                       'duration': duration, 'parent_shares': parent_shares})
+                       'duration': duration, 'id_hash': id_hash,
+                       'parent_shares': parent_shares})
     act_vecs = rarr((n, n_cls), np.float16)
     emb_vecs = rarr((n, n_dim), np.float16)
     sim_act = rarr((n, n), np.float16)
@@ -135,10 +159,16 @@ def read_blob(path, to_f32: bool = True) -> dict:
     sim_blend = rarr((n, n), np.float16)
     topk_ids = rarr((n, TOP_K), np.uint32)
     topk_sims = rarr((n, TOP_K), np.float16)
+    n_sheets, sheet_dim, tile, _reserved = take('<HHHH')
+    tiles = [take('<HHH') for _ in range(n)]
+    sha256s = [buf[off + i * 32: off + (i + 1) * 32].hex() for i in range(n_sheets)]
+    off += n_sheets * 32
     if off != len(buf):
         raise ValueError(f'trailing bytes: off={off} len={len(buf)}')
     return {'version': version, 'flags': flags, 'build_ts': build_ts,
             'class_names': class_names, 'albums': albums,
             'act_vecs': act_vecs, 'emb_vecs': emb_vecs,
             'sim_act': sim_act, 'sim_emb': sim_emb, 'sim_blend': sim_blend,
-            'topk_ids': topk_ids, 'topk_sims': topk_sims}
+            'topk_ids': topk_ids, 'topk_sims': topk_sims,
+            'images': {'n_sheets': n_sheets, 'sheet_dim': sheet_dim, 'tile': tile,
+                       'tiles': tiles, 'sha256': sha256s}}

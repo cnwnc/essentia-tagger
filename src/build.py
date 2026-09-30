@@ -68,6 +68,8 @@ def main():
                     help='blend weight for the activations channel (embeddings get the rest)')
     ap.add_argument('--artist-bonus', type=float, default=0.1,
                     help='additive blend boost for albums sharing an artist name')
+    ap.add_argument('--atlas-manifest', default=None,
+                    help='atlas-manifest.json from the atlas builder (embeds tile positions)')
     args = ap.parse_args()
 
     tree = Path(args.tree).resolve()
@@ -114,7 +116,8 @@ def main():
         albums.append({'artist': first.get('artist', ''),
                        'album': first.get('album', ''),
                        'track_count': len(tracks),
-                       'duration': round(total_dur, 3)})
+                       'duration': round(total_dur, 3),
+                       'album_dir': d})
 
     # parent shares: row-normalized activations (sum -> 1; all-zero rows stay 0)
     sums = act.sum(axis=1, keepdims=True)
@@ -144,12 +147,35 @@ def main():
         topk_ids[i, :k] = idx
         topk_sims[i, :k] = row[idx]
 
+    # stable ids (sha256-based, independent of row order)
+    for a in albums:
+        a['id_hash'] = blobmod.album_id_hash(a['artist'], a['album_dir'])
+
+    # atlas positions from the atlas builder's manifest (optional)
+    images = None
+    if args.atlas_manifest:
+        mpath = Path(args.atlas_manifest)
+        if mpath.exists():
+            man = json.load(open(mpath))
+            n_sheets = man.get('n_sheets', len(man.get('sheets', [])))
+            tiles = [man['albums'].get(d, {'sheet': blobmod.NO_TILE, 'tx': 0, 'ty': 0})
+                     for d in album_dirs]
+            images = {'n_sheets': n_sheets, 'sheet_dim': man['sheet_dim'],
+                      'tile': man['tile'],
+                      'tiles': [(t['sheet'], t['tx'], t['ty']) for t in tiles],
+                      'sha256': man['sha256']}
+            have = sum(1 for t in tiles if t['sheet'] != blobmod.NO_TILE)
+            print(f'atlas: {n_sheets} sheet(s), {have}/{n} albums tiled', flush=True)
+        else:
+            print(f'WARN: atlas manifest not found at {mpath}; blob will have no images',
+                  file=sys.stderr, flush=True)
+
     build_ts = int(time.time())
     out = Path(args.out).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(out.suffix + '.tmp')
     blobmod.write_blob(tmp, build_ts, classes, albums, act, emb,
-                       sim_act, sim_emb, blend, (topk_ids, topk_sims))
+                       sim_act, sim_emb, blend, (topk_ids, topk_sims), images=images)
     tmp.rename(out)
 
     mb = out.stat().st_size / 1e6
@@ -159,6 +185,11 @@ def main():
     chk = blobmod.read_blob(out)
     assert chk['class_names'] == classes
     assert len(chk['albums']) == n
+    assert all(a['id_hash'] for a in chk['albums'])
+    if images:
+        assert chk['images']['n_sheets'] == images['n_sheets']
+        assert sum(1 for s, _, _ in chk['images']['tiles'] if s != blobmod.NO_TILE) == \
+            sum(1 for s, _, _ in images['tiles'] if s != blobmod.NO_TILE)
     assert np.allclose(cosines(chk['act_vecs']), sim_act, atol=5e-3)
     assert np.allclose(cosines(chk['emb_vecs']), sim_emb, atol=5e-3)
     top1 = chk['albums'][int(chk['topk_ids'][0][0])]
