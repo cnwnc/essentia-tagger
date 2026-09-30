@@ -66,6 +66,10 @@ class Classifier:
     def __init__(self):
         from essentia.standard import TensorflowPredictMAEST, TensorflowPredict
         from essentia import Pool
+        import essentia
+        # per-patch "[ WARNING ] No network created..." spam during steady-state
+        # inference (harmless; essentia logs at WARNING for every TF session run)
+        essentia.log.warningActive = False
         emb_path, head_path, classes_json = model_paths()
         self._Pool = Pool
         self.classes = load_classes(classes_json)

@@ -225,6 +225,9 @@
               after = [ "tagger-venv.service" "network.target" ];
               environment = modelEnvAttrs // {
                 TAGGER_VENV = "/var/lib/tagger-classifier/venv";
+                # don't let TF grab ~all VRAM at warmup (this is a gaming PC);
+                # allocate on demand instead of ~9GB upfront
+                TF_FORCE_GPU_ALLOW_GROWTH = "true";
               };
               serviceConfig = {
                 ExecStart = "${wrappers.tagger-server}/bin/tagger-server --bind ${cfg.bind} --port ${toString cfg.port} --idle-timeout ${toString cfg.idleTimeout}";

@@ -21,8 +21,20 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from urllib.parse import urlparse
 
 import schema
+
+
+def normalize_url(u: str) -> str:
+    """Accept 'host:port' as well as 'http://host:port' (urllib chokes on
+    schemeless URLs: 'unknown url type')."""
+    if '://' not in u:
+        u = 'http://' + u
+    p = urlparse(u)
+    if p.scheme not in ('http', 'https') or not p.netloc:
+        raise SystemExit(f'--url must be an http(s) URL, got: {u!r}')
+    return u.rstrip('/')
 
 
 def find_audio(music: Path):
@@ -116,6 +128,7 @@ def main():
 
     music = Path(args.music).resolve()
     tree = Path(args.tree).resolve()
+    base_url = normalize_url(args.url)
     tree.mkdir(parents=True, exist_ok=True)
     lockfile = open(tree / '.sync.lock', 'w')
     try:
@@ -153,8 +166,8 @@ def main():
         packed = pack_batch(batch, tree)
         try:
             print(f'batch {i}/{len(batches)}: {packed.stat().st_size/1e6:.0f}MB '
-                  f'compressed — sending...', flush=True)
-            results, errors, _ = classify(args.url, packed, args.timeout)
+                  f'compressed — sending to {base_url}...', flush=True)
+            results, errors, _ = classify(base_url, packed, args.timeout)
         finally:
             packed.unlink(missing_ok=True)
         for rel, data in results:
