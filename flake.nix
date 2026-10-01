@@ -161,6 +161,7 @@
         tagger-build = mkWrapper "tagger-build" "build.py" true;
         tagger-atlas = mkWrapper "tagger-atlas" "atlas.py" true;
         tagger-serve = mkWrapper "tagger-serve" "serve.py" true;
+        tagger-radiomap = mkWrapper "tagger-radiomap" "radiomap.py" true;
       };
     in
     {
@@ -323,6 +324,7 @@
               MAN="--atlas-manifest ${atlasDir'}/atlas-manifest.json"
             fi
             ${wrappers.tagger-build}/bin/tagger-build --tree ${tree'} --out ${blob'} $MAN
+            ${wrappers.tagger-radiomap}/bin/tagger-radiomap --blob ${blob'} --music ${cfg.musicDir} --out ${atlasDir'}/radio-map.json || echo "WARN: radio map build failed; /radio-map unavailable" 
           '';
         in {
           options.services.tagger-index = {
@@ -448,7 +450,7 @@
               requires = [ "tagger-venv.service" ];
               environment = { TAGGER_VENV = "${cfg.stateDir}/venv"; };
               serviceConfig = {
-                ExecStart = "${wrappers.tagger-serve}/bin/tagger-serve --blob ${blob'} --atlas-dir ${atlasDir'} --bind ${cfg.bind} --port ${toString cfg.port}";
+                ExecStart = "${wrappers.tagger-serve}/bin/tagger-serve --blob ${blob'} --atlas-dir ${atlasDir'} --radio-map ${atlasDir'}/radio-map.json --bind ${cfg.bind} --port ${toString cfg.port}";
                 User = "essentia";
                 Group = "essentia";
                 StateDirectory = "essentia";

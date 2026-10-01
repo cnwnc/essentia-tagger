@@ -64,6 +64,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
     blob: FileState = None
     atlas: AtlasStore = None  # set by serve() when --atlas-dir is given
+    radio_map_path: Path = None  # set by serve() when --radio-map is given
+    radio_map_state = None
+    radio_map_lock = threading.Lock()
+
+    @classmethod
+    def radio_map(cls):
+        """Fresh-stat FileState for the radio map (None if absent/removed).
+        Re-statted per request so rebuilds update the ETag live."""
+        if cls.radio_map_path is None:
+            return None
+        with cls.radio_map_lock:
+            try:
+                if cls.radio_map_state is None:
+                    cls.radio_map_state = FileState(cls.radio_map_path)
+                else:
+                    cls.radio_map_state.refresh()
+                if not cls.radio_map_state.path.exists():
+                    return None
+                return cls.radio_map_state
+            except OSError:
+                return None
 
     def _send_headers(self, st: FileState, code, length=None):
         self.send_response(code)
@@ -99,6 +120,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ('/', '/blob', '/albums'):
             self._handle_file(self.blob, head_only=False)
+        elif self.path == '/radio-map':
+            st = self.radio_map()
+            if st is None:
+                self._send_headers(self.blob, 404, 0)
+            else:
+                self._handle_file(st, head_only=False)
         elif self.path.startswith('/atlas/') and self.atlas is not None:
             st = self.atlas.get(self.path[len('/atlas/'):])
             if st is None:
@@ -111,6 +138,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_HEAD(self):
         if self.path in ('/', '/blob', '/albums'):
             self._handle_file(self.blob, head_only=True)
+        elif self.path == '/radio-map':
+            st = self.radio_map()
+            if st is None:
+                self._send_headers(self.blob, 404, 0)
+            else:
+                self._handle_file(st, head_only=True)
         elif self.path.startswith('/atlas/') and self.atlas is not None:
             st = self.atlas.get(self.path[len('/atlas/'):])
             if st is None:
@@ -133,10 +166,12 @@ class QuietServer(http.server.ThreadingHTTPServer):
         super().handle_error(request, client_address)
 
 
-def serve(blob_path, bind, port, atlas_dir=None):
+def serve(blob_path, bind, port, atlas_dir=None, radio_map=None):
     Handler.blob = FileState(blob_path)
     if atlas_dir:
         Handler.atlas = AtlasStore(Path(atlas_dir))
+    if radio_map:
+        Handler.radio_map_path = Path(radio_map)
     QuietServer((bind, port), Handler).serve_forever()
 
 
@@ -145,13 +180,15 @@ def main():
     ap.add_argument('--blob', required=True, help='blob file to serve')
     ap.add_argument('--atlas-dir', default=None,
                     help='dir with atlas-<n>.webp sheets (enables /atlas/<n>.webp)')
+    ap.add_argument('--radio-map', default=None,
+                    help='radio-map.json path (enables /radio-map)')
     ap.add_argument('--bind', default='0.0.0.0')
     ap.add_argument('--port', type=int, default=9478)
     args = ap.parse_args()
     print(f'serving {args.blob}' +
           (f' + atlas {args.atlas_dir}' if args.atlas_dir else '') +
           f' on {args.bind}:{args.port}', flush=True)
-    serve(args.blob, args.bind, args.port, args.atlas_dir)
+    serve(args.blob, args.bind, args.port, args.atlas_dir, args.radio_map)
 
 
 if __name__ == '__main__':
