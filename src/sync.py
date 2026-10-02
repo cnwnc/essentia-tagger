@@ -79,22 +79,49 @@ def pack_batch(albums: dict, tmpdir: Path) -> Path:
 
 
 def classify(url: str, batch: Path, timeout: float) -> tuple[list, list, int]:
-    """POST the batch; returns (results[(rel, json_bytes)], errors, http_code)."""
-    boundary_body = open(batch, 'rb')
-    req = urllib.request.Request(
-        url.rstrip('/') + '/classify', data=boundary_body, method='POST',
-        headers={'Content-Type': 'application/x-zstd-tar',
-                 'Content-Length': str(batch.stat().st_size)})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            payload = resp.read()
-            code = resp.status
-    except urllib.error.HTTPError as e:
-        boundary_body.close()
-        detail = e.read()[:500]
-        raise RuntimeError(f'classifier returned {e.code}: {detail}') from None
-    finally:
-        boundary_body.close()
+    """POST the batch; returns (results[(rel, json_bytes)], errors, http_code).
+
+    409 (single job slot busy) and transient connection errors are retried
+    with backoff instead of killing the run: a backlog batch can hold the
+    classifier for tens of minutes, and the timer will just re-run anyway."""
+    delays = [30, 60, 120, 240, 480, 480, 480, 480, 480, 480]
+    attempt = 0
+    while True:
+        boundary_body = open(batch, 'rb')
+        req = urllib.request.Request(
+            url.rstrip('/') + '/classify', data=boundary_body, method='POST',
+            headers={'Content-Type': 'application/x-zstd-tar',
+                     'Content-Length': str(batch.stat().st_size)})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                payload = resp.read()
+                code = resp.status
+            break
+        except urllib.error.HTTPError as e:
+            body = b''
+            try:
+                body = e.read()[:500]
+            except Exception:
+                pass
+            if e.code == 409 and attempt < len(delays):
+                wait = delays[attempt]
+                attempt += 1
+                print(f'classifier busy (409), retry {attempt}/{len(delays)} '
+                      f'in {wait}s...', flush=True)
+                time.sleep(wait)
+                continue
+            raise RuntimeError(f'classifier returned {e.code}: {body}') from None
+        except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as e:
+            if attempt < len(delays):
+                wait = delays[attempt]
+                attempt += 1
+                print(f'classifier connection error ({type(e).__name__}: {e}), '
+                      f'retry {attempt}/{len(delays)} in {wait}s...', flush=True)
+                time.sleep(wait)
+                continue
+            raise
+        finally:
+            boundary_body.close()
 
     results, errors = [], []
     with subprocess.Popen(['zstd', '-dc'], stdin=subprocess.PIPE,

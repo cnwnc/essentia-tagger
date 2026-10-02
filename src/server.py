@@ -141,12 +141,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(404, {'error': 'not found'})
             return
         if not self.engine.acquire(blocking=False):
+            self._drain_request()
             self._json(409, {'error': 'busy: another classification job is running'})
             return
         try:
             self._classify()
         finally:
             self.engine.release()
+
+    def _drain_request(self, cap=8 << 30):
+        """Discard an unaccepted request body before responding, else the
+        pending-upload client eats a TCP reset mid-send (broken pipe) instead
+        of the clean 409."""
+        try:
+            length = min(int(self.headers.get('Content-Length', 0)), cap)
+            written = 0
+            while written < length:
+                chunk = self.rfile.read(min(1 << 20, length - written))
+                if not chunk:
+                    break
+                written += len(chunk)
+        except DISCONNECT:
+            self.close_connection = True
+        except Exception:
+            self.close_connection = True
 
     def _classify(self):
         job = f'tagger-{uuid.uuid4().hex}'
